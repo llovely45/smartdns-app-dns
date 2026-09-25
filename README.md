@@ -43,9 +43,16 @@ DNS 参数接受 IPv4 或 IPv6 地址。可以先用 `sudo smartdns-app-dns --li
 - 自动查找常见配置路径，并尝试从 systemd 服务、运行中的 SmartDNS 进程和 `/etc`、`/usr/local/etc`、`/opt` 下的 SmartDNS 配置文件定位实际配置。也可用 `--config /path/to/smartdns.conf` 或 `SMARTDNS_CONFIG=/path/to/smartdns.conf` 指定文件。
 - 找到配置后，先创建带时间戳的 `.bak.*` 备份，再更新所选应用的域名路由；已有应用路由会切换到新 group，缺少的应用规则会自动追加。
 - 修改 `/etc` 下的配置时会先尝试 `chattr -i`，写入后再执行 `chattr +i`。若现有 immutable 锁无法解开会停止；若系统没有 `chattr` 会提示无法锁定后继续。工具不会修改 `/etc/resolv.conf`。
-- 每个应用使用独立的 `appdns_<应用名>` group，并带 `-exclude-default-group`，避免该上游 DNS 混入默认组。
+- 每个应用使用独立的 `appdns_<应用名>` group：你指定的 DNS 是首选上游，`1.1.1.1` 作为 SmartDNS `-fallback` 备用上游。首选 DNS 无响应时，SmartDNS 重试时会使用备用 DNS；备用 DNS 不参与首次查询。若首选地址本身就是 `1.1.1.1`，只生成一次。
+- 主 DNS 返回有效答复但内容不符合预期（例如 `NXDOMAIN`）时，不一定会触发回落；回落由 SmartDNS 的上游失败与重试逻辑决定。
 - 默认重启 `smartdns` 服务使配置生效。可用 `--no-restart` 跳过；`--dry-run` 只显示差异，不写文件也不重启。
 - 如果安装后仍没有 SmartDNS 配置文件，命令会报错并提示如何指定路径。安装器不会修改系统 `resolv.conf`。
+
+升级后，重新运行一键安装命令并传入需要更新的应用参数，即可为这些应用写入 `1.1.1.1` 备用 DNS。例如：
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/llovely45/smartdns-app-dns/main/install.sh | sudo bash -s -- --youtube 1.1.1.1 --netflix 8.8.8.8
+```
 
 ## 支持的应用
 

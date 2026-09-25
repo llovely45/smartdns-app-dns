@@ -9,6 +9,7 @@ fi
 CONFIG_DIR="/etc/smartdns-app-dns"
 EXTENSION_DIR="${SMARTDNS_APP_DNS_EXTENSION_DIR:-$CONFIG_DIR/apps.d}"
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+FALLBACK_DNS="1.1.1.1"
 
 declare -A APP_DOMAINS=()
 declare -A DOMAIN_OWNER=()
@@ -30,6 +31,8 @@ SmartDNS App DNS — 为指定应用配置独立上游 DNS
   --dry-run               展示将要写入的差异，不修改文件
   --list                  列出应用名和域名
   -h, --help              显示帮助
+
+应用 DNS 无响应时，SmartDNS 会按重试逻辑回落到 1.1.1.1。
 
 默认检测路径:
   /etc/smartdns/smartdns.conf
@@ -336,7 +339,7 @@ for slug in "${REQUEST_ORDER[@]}"; do
   printf '%s|%s|%s\n' "$slug" "${REQUESTED_DNS[$slug]}" "${APP_DOMAINS[$slug]}"
 done > "$REQUEST_FILE"
 
-if ! awk -v reqfile="$REQUEST_FILE" '
+if ! awk -v reqfile="$REQUEST_FILE" -v fallback_dns="$FALLBACK_DNS" '
   BEGIN {
     begin_prefix = "# BEGIN smartdns-app-dns:"
     end_prefix = "# END smartdns-app-dns:"
@@ -409,6 +412,8 @@ if ! awk -v reqfile="$REQUEST_FILE" '
       group_name = sprintf("appdns_%s", slug)
       printf "# BEGIN smartdns-app-dns:%s\n", slug
       printf "server %s -group %s -exclude-default-group\n", dns[slug], group_name
+      if (dns[slug] != fallback_dns)
+        printf "server %s -group %s -exclude-default-group -fallback\n", fallback_dns, group_name
       for (i = 1; i <= domain_count[slug]; i++) {
         domain_key = sprintf("%s%c%d", slug, SUBSEP, i)
         printf "nameserver /%s/%s\n", domain[domain_key], group_name
