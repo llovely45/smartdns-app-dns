@@ -4,7 +4,7 @@
 
 ## 一键安装并设置
 
-下面命令会安装 `smartdns-app-dns`，然后立即把 YouTube 的上游 DNS 设为 `1.1.1.1`：
+下面命令会先检查 SmartDNS。若系统尚未安装，会从 SmartDNS 官方 GitHub Release 下载适配当前系统和架构的安装包并安装；然后安装 `smartdns-app-dns`，最后把 YouTube 的上游 DNS 设为 `1.1.1.1`：
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/llovely45/smartdns-app-dns/main/install.sh | sudo bash -s -- --youtube 1.1.1.1
@@ -19,7 +19,7 @@ curl -fsSL https://raw.githubusercontent.com/llovely45/smartdns-app-dns/main/ins
   --openai 9.9.9.9
 ```
 
-只安装命令，稍后再配置：
+安装 SmartDNS 和命令，稍后再配置：
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/llovely45/smartdns-app-dns/main/install.sh | sudo bash
@@ -29,6 +29,15 @@ sudo smartdns-app-dns --youtube 1.1.1.1
 DNS 参数接受 IPv4 或 IPv6 地址。可以先用 `sudo smartdns-app-dns --list` 查看应用和域名清单。
 目标系统需要 Bash 4 或更新版本。
 
+## 安装 SmartDNS
+
+- 如果检测到已有 SmartDNS 程序、软件包或服务，安装器会跳过 SmartDNS 安装，并使用现有配置。
+- Debian/Ubuntu 优先使用 SmartDNS 官方 Release 中匹配 CPU 架构的 `.deb` 包，通过 `apt-get` 安装依赖；不会运行 `apt-get update`，也不会升级系统软件。
+- 其他 Linux 发行版使用官方通用 Linux 压缩包及其自带安装脚本。当前 Release 没有适配包的系统或架构会明确报错。
+- 安装包会按 GitHub Release API 提供的 SHA-256 摘要校验；校验失败时停止安装。
+- 如果程序或服务已存在，但找不到 SmartDNS 配置文件，仍会停止并提示使用 `--config`；不会重复安装或猜测其他配置。
+- 安装 SmartDNS 不会修改 `/etc/resolv.conf`。单独运行 `smartdns-app-dns` 命令只更新已有 SmartDNS 配置，不负责安装 SmartDNS。
+
 ## 工作方式
 
 - 自动查找常见配置路径，并尝试从 systemd 服务、运行中的 SmartDNS 进程和 `/etc`、`/usr/local/etc`、`/opt` 下的 SmartDNS 配置文件定位实际配置。也可用 `--config /path/to/smartdns.conf` 或 `SMARTDNS_CONFIG=/path/to/smartdns.conf` 指定文件。
@@ -36,7 +45,7 @@ DNS 参数接受 IPv4 或 IPv6 地址。可以先用 `sudo smartdns-app-dns --li
 - 修改 `/etc` 下的配置时会先尝试 `chattr -i`，写入后再执行 `chattr +i`。若现有 immutable 锁无法解开会停止；若系统没有 `chattr` 会提示无法锁定后继续。工具不会修改 `/etc/resolv.conf`。
 - 每个应用使用独立的 `appdns_<应用名>` group，并带 `-exclude-default-group`，避免该上游 DNS 混入默认组。
 - 默认重启 `smartdns` 服务使配置生效。可用 `--no-restart` 跳过；`--dry-run` 只显示差异，不写文件也不重启。
-- 如果没有 SmartDNS 配置文件，命令会报错并提示如何指定路径。安装器只安装本工具，不安装 SmartDNS，也不修改系统 `resolv.conf`。
+- 如果安装后仍没有 SmartDNS 配置文件，命令会报错并提示如何指定路径。安装器不会修改系统 `resolv.conf`。
 
 ## 支持的应用
 
