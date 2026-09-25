@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
+if ((BASH_VERSINFO[0] < 4)); then
+  printf 'smartdns-app-dns 需要 Bash 4 或更新版本。\n' >&2
+  exit 1
+fi
+
 CONFIG_DIR="/etc/smartdns-app-dns"
 EXTENSION_DIR="${SMARTDNS_APP_DNS_EXTENSION_DIR:-$CONFIG_DIR/apps.d}"
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
@@ -30,8 +35,10 @@ SmartDNS App DNS — 为指定应用配置独立上游 DNS
   /etc/smartdns/smartdns.conf
   /etc/smartdns.conf
   /usr/local/etc/smartdns/smartdns.conf
+  另外尝试从 systemd/运行进程和常见配置目录定位。
 
 可在 /etc/smartdns-app-dns/apps.d/*.tsv 中添加自定义应用。
+也可通过 SMARTDNS_CONFIG 环境变量指定配置文件。
 EOF
 }
 
@@ -106,6 +113,115 @@ print_apps() {
   done | sort
 }
 
+config_from_command_line() {
+  local command_line="$1" candidate
+  local config_pattern='(^|[[:space:]])-c[[:space:]]+([^[:space:];}"]+)'
+  if [[ "$command_line" =~ $config_pattern ]]; then
+    candidate="${BASH_REMATCH[2]}"
+    [[ -f "$candidate" ]] || return 1
+    printf '%s\n' "$candidate"
+    return 0
+  fi
+  return 1
+}
+
+discover_running_config() {
+  local command_line proc_args candidate unit
+  if command -v systemctl >/dev/null 2>&1; then
+    for unit in smartdns.service smartdns; do
+      command_line="$(systemctl show "$unit" --property=ExecStart --value 2>/dev/null || true)"
+      if candidate="$(config_from_command_line "$command_line" 2>/dev/null)"; then
+        printf '%s\n' "$candidate"
+        return 0
+      fi
+    done
+  fi
+
+  if [[ -d /proc ]]; then
+    for proc_args in /proc/[0-9]*/cmdline; do
+      [[ -r "$proc_args" ]] || continue
+      command_line="$(tr '\0' ' ' < "$proc_args" 2>/dev/null || true)"
+      [[ "$command_line" == *smartdns* && "$command_line" != *smartdns-app-dns* ]] || continue
+      if candidate="$(config_from_command_line "$command_line" 2>/dev/null)"; then
+        printf '%s\n' "$candidate"
+        return 0
+      fi
+    done
+  fi
+  return 1
+}
+
+discover_config_file() {
+  local candidate root
+  local -A discovered=()
+  local -a matches=()
+  for root in /etc /usr/local/etc /opt; do
+    [[ -d "$root" ]] || continue
+    while IFS= read -r candidate; do
+      [[ -f "$candidate" ]] && discovered["$candidate"]=1
+    done < <(find "$root" -type f \( -path '*/smartdns/*.conf' -o -path '*/smartdns.conf.d/*.conf' -o -name 'smartdns*.conf' \) -print 2>/dev/null)
+  done
+
+  if ((${#discovered[@]} > 0)); then
+    for candidate in "${!discovered[@]}"; do
+      matches+=("$candidate")
+    done
+  fi
+  if ((${#matches[@]} == 1)); then
+    printf '%s\n' "${matches[0]}"
+    return 0
+  fi
+  if ((${#matches[@]} > 1)); then
+    printf '发现多个 SmartDNS 配置文件，请使用 --config 指定其中一个：\n' >&2
+    printf '  %s\n' "${matches[@]}" >&2
+  fi
+  return 1
+}
+
+NEEDS_RELOCK=0
+WAS_IMMUTABLE=0
+WORK_DIR=""
+
+cleanup() {
+  local result=$?
+  if ((NEEDS_RELOCK)) && [[ -n "${CONFIG_PATH:-}" ]] && command -v chattr >/dev/null 2>&1; then
+    chattr +i "$CONFIG_PATH" 2>/dev/null || printf '警告：未能恢复 /etc 配置文件的 immutable 锁：%s\n' "$CONFIG_PATH" >&2
+    NEEDS_RELOCK=0
+  fi
+  if [[ -n "$WORK_DIR" && -d "$WORK_DIR" ]]; then
+    rm -rf -- "$WORK_DIR"
+  fi
+  return "$result"
+}
+
+prepare_config_replace() {
+  local attributes="" attribute_flags="" attribute_check_available=0
+  [[ "$CONFIG_PATH" == /etc/* ]] || return 0
+
+  if command -v lsattr >/dev/null 2>&1; then
+    attribute_check_available=1
+    attributes="$(lsattr -d "$CONFIG_PATH" 2>/dev/null || true)"
+    attribute_flags="${attributes%%[[:space:]]*}"
+    [[ "$attribute_flags" == *i* ]] && WAS_IMMUTABLE=1
+  fi
+
+  if command -v chattr >/dev/null 2>&1; then
+    if chattr -i "$CONFIG_PATH" 2>/dev/null; then
+      if ((WAS_IMMUTABLE || !attribute_check_available)); then
+        NEEDS_RELOCK=1
+      fi
+    elif ((WAS_IMMUTABLE || !attribute_check_available)); then
+      die "无法确认配置文件已解锁；chattr -i 失败：$CONFIG_PATH"
+    else
+      printf '警告：chattr -i 未能解锁（文件可能未上锁或文件系统不支持），继续尝试写入。\n' >&2
+    fi
+  elif ((WAS_IMMUTABLE)); then
+    die "配置文件带 immutable 锁，但系统没有 chattr：$CONFIG_PATH"
+  else
+    printf '警告：未安装 chattr，无法解锁或锁定 /etc 配置文件。\n' >&2
+  fi
+}
+
 BASE_CATALOG="$SCRIPT_DIR/apps.tsv"
 [[ -f "$BASE_CATALOG" ]] || BASE_CATALOG="/usr/local/share/smartdns-app-dns/apps.tsv"
 [[ -f "$BASE_CATALOG" ]] || die "找不到应用清单 apps.tsv"
@@ -115,7 +231,7 @@ for catalog in "$EXTENSION_DIR"/*.tsv; do
   load_catalog_file "$catalog"
 done
 
-CONFIG_ARG=""
+CONFIG_ARG="${SMARTDNS_CONFIG:-}"
 DO_RESTART=1
 DRY_RUN=0
 LIST_ONLY=0
@@ -186,17 +302,22 @@ if [[ -n "$CONFIG_ARG" ]]; then
   [[ -f "$CONFIG_ARG" ]] || die "SmartDNS 配置文件不存在：$CONFIG_ARG"
   CONFIG_PATH="$CONFIG_ARG"
 else
-  CONFIG_PATH=""
-  for candidate in \
-    /etc/smartdns/smartdns.conf \
-    /etc/smartdns.conf \
-    /usr/local/etc/smartdns/smartdns.conf; do
-    if [[ -f "$candidate" ]]; then
-      CONFIG_PATH="$candidate"
-      break
-    fi
-  done
-  [[ -n "$CONFIG_PATH" ]] || die "未找到 SmartDNS 配置文件；请确认 SmartDNS 已安装，或使用 --config 指定路径"
+  CONFIG_PATH="$(discover_running_config || true)"
+  if [[ -z "$CONFIG_PATH" ]]; then
+    for candidate in \
+      /etc/smartdns/smartdns.conf \
+      /etc/smartdns.conf \
+      /usr/local/etc/smartdns/smartdns.conf; do
+      if [[ -f "$candidate" ]]; then
+        CONFIG_PATH="$candidate"
+        break
+      fi
+    done
+  fi
+  if [[ -z "$CONFIG_PATH" ]]; then
+    CONFIG_PATH="$(discover_config_file || true)"
+  fi
+  [[ -n "$CONFIG_PATH" ]] || die "未找到 SmartDNS 配置文件。此工具只修改已有配置；请先安装/初始化 SmartDNS，或使用 --config/SMARTDNS_CONFIG 指定路径"
 fi
 
 if command -v readlink >/dev/null 2>&1; then
@@ -207,7 +328,7 @@ fi
 CONFIG_PARENT="$(dirname -- "$CONFIG_PATH")"
 
 WORK_DIR="$(mktemp -d "$CONFIG_PARENT/.smartdns-app-dns.XXXXXX")" || die "无法在配置目录创建临时文件：$CONFIG_PARENT"
-trap 'rm -rf -- "$WORK_DIR"' EXIT
+trap cleanup EXIT
 REQUEST_FILE="$WORK_DIR/requested.tsv"
 NEW_CONFIG="$WORK_DIR/smartdns.conf"
 cp -p -- "$CONFIG_PATH" "$NEW_CONFIG"
@@ -229,10 +350,12 @@ if ! awk -v reqfile="$REQUEST_FILE" '
       dns[slug] = fields[2]
       order[++app_count] = slug
       requested[slug] = 1
-      target_group["appdns_" slug] = 1
+      group_name = sprintf("appdns_%s", slug)
+      target_group[group_name] = 1
       domain_count[slug] = split(fields[3], domain_list, ",")
       for (i = 1; i <= domain_count[slug]; i++) {
-        domain[slug, i] = domain_list[i]
+        domain_key = sprintf("%s%c%d", slug, SUBSEP, i)
+        domain[domain_key] = domain_list[i]
         target_domain[domain_list[i]] = 1
       }
     }
@@ -276,19 +399,21 @@ if ! awk -v reqfile="$REQUEST_FILE" '
   }
   END {
     if (skipping) {
-      print "配置中的托管区块缺少匹配的 END 标记：" skipped_slug > "/dev/stderr"
+      printf "配置中的托管区块缺少匹配的 END 标记：%s\n", skipped_slug > "/dev/stderr"
       exit 3
     }
-    print ""
-    print "# Generated by smartdns-app-dns. Edit apps.tsv to change the domain list."
+    printf "\n"
+    printf "# Generated by smartdns-app-dns. Edit apps.tsv to change the domain list.\n"
     for (app = 1; app <= app_count; app++) {
       slug = order[app]
-      group = "appdns_" slug
-      print "# BEGIN smartdns-app-dns:" slug
-      print "server " dns[slug] " -group " group " -exclude-default-group
-      for (i = 1; i <= domain_count[slug]; i++)
-        print "nameserver /" domain[slug, i] "/" group
-      print "# END smartdns-app-dns:" slug
+      group_name = sprintf("appdns_%s", slug)
+      printf "# BEGIN smartdns-app-dns:%s\n", slug
+      printf "server %s -group %s -exclude-default-group\n", dns[slug], group_name
+      for (i = 1; i <= domain_count[slug]; i++) {
+        domain_key = sprintf("%s%c%d", slug, SUBSEP, i)
+        printf "nameserver /%s/%s\n", domain[domain_key], group_name
+      }
+      printf "# END smartdns-app-dns:%s\n", slug
     }
   }
 ' "$CONFIG_PATH" > "$NEW_CONFIG"; then
@@ -302,6 +427,7 @@ if ((DRY_RUN)); then
   exit 0
 fi
 
+prepare_config_replace
 timestamp="$(date '+%Y%m%d%H%M%S')"
 BACKUP_PATH="${CONFIG_PATH}.bak.${timestamp}"
 if [[ -e "$BACKUP_PATH" ]]; then
@@ -309,6 +435,16 @@ if [[ -e "$BACKUP_PATH" ]]; then
 fi
 cp -p -- "$CONFIG_PATH" "$BACKUP_PATH" || die "创建备份失败：$BACKUP_PATH"
 mv -f -- "$NEW_CONFIG" "$CONFIG_PATH" || die "写入失败；原配置备份在 $BACKUP_PATH"
+if [[ "$CONFIG_PATH" == /etc/* ]] && command -v chattr >/dev/null 2>&1; then
+  NEEDS_RELOCK=1
+  if chattr +i "$CONFIG_PATH"; then
+    NEEDS_RELOCK=0
+    printf '已重新锁定配置文件（immutable）：%s\n' "$CONFIG_PATH"
+  else
+    printf '错误：配置已写入，但 chattr +i 失败：%s\n' "$CONFIG_PATH" >&2
+    exit 1
+  fi
+fi
 
 printf '已更新 %s\n' "$CONFIG_PATH"
 printf '原配置备份：%s\n' "$BACKUP_PATH"

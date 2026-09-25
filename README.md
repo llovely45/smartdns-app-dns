@@ -27,11 +27,13 @@ sudo smartdns-app-dns --youtube 1.1.1.1
 ```
 
 DNS 参数接受 IPv4 或 IPv6 地址。可以先用 `sudo smartdns-app-dns --list` 查看应用和域名清单。
+目标系统需要 Bash 4 或更新版本。
 
 ## 工作方式
 
-- 自动查找 `/etc/smartdns/smartdns.conf`、`/etc/smartdns.conf` 和 `/usr/local/etc/smartdns/smartdns.conf`。也可用 `--config /path/to/smartdns.conf` 指定文件。
+- 自动查找常见配置路径，并尝试从 systemd 服务、运行中的 SmartDNS 进程和 `/etc`、`/usr/local/etc`、`/opt` 下的 SmartDNS 配置文件定位实际配置。也可用 `--config /path/to/smartdns.conf` 或 `SMARTDNS_CONFIG=/path/to/smartdns.conf` 指定文件。
 - 找到配置后，先创建带时间戳的 `.bak.*` 备份，再更新所选应用的域名路由；已有应用路由会切换到新 group，缺少的应用规则会自动追加。
+- 修改 `/etc` 下的配置时会先尝试 `chattr -i`，写入后再执行 `chattr +i`。若现有 immutable 锁无法解开会停止；若系统没有 `chattr` 会提示无法锁定后继续。工具不会修改 `/etc/resolv.conf`。
 - 每个应用使用独立的 `appdns_<应用名>` group，并带 `-exclude-default-group`，避免该上游 DNS 混入默认组。
 - 默认重启 `smartdns` 服务使配置生效。可用 `--no-restart` 跳过；`--dry-run` 只显示差异，不写文件也不重启。
 - 如果没有 SmartDNS 配置文件，命令会报错并提示如何指定路径。安装器只安装本工具，不安装 SmartDNS，也不修改系统 `resolv.conf`。
