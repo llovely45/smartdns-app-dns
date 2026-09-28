@@ -8,6 +8,21 @@ SMARTDNS_REPOSITORY="pymumu/smartdns"
 BIN_DIR="/usr/local/bin"
 SHARE_DIR="/usr/local/share/smartdns-app-dns"
 BIN_PATH="$BIN_DIR/smartdns-app-dns"
+INSTALL_ONLY=0
+declare -a APP_ARGS=()
+
+for arg in "$@"; do
+  if [[ "$arg" == --install-only ]]; then
+    INSTALL_ONLY=1
+  else
+    APP_ARGS+=("$arg")
+  fi
+done
+if ((INSTALL_ONLY)) && ((${#APP_ARGS[@]} > 0)); then
+  printf '错误：--install-only 不能与其他参数同时使用。\n' >&2
+  exit 2
+fi
+set -- "${APP_ARGS[@]}"
 
 if [[ "$(id -u)" -ne 0 ]]; then
   printf '请使用 root 运行安装器，例如：curl ... | sudo bash -s -- --youtube 1.1.1.1\n' >&2
@@ -253,14 +268,9 @@ printf 'smartdns-app-dns 已安装到 %s\n' "$BIN_PATH"
 printf '应用清单：%s/apps.tsv\n' "$SHARE_DIR"
 printf '自定义清单目录：/etc/smartdns-app-dns/apps.d\n'
 
-if (($# > 0)); then
-  if "$BIN_PATH" "$@"; then
-    exit 0
-  else
-    result=$?
-    exit "$result"
-  fi
+if ((INSTALL_ONLY)); then
+  printf '按 --install-only 要求，仅安装程序；未写入应用 DNS 规则。\n'
+  exit 0
 fi
 
-printf '查看应用：sudo smartdns-app-dns --list\n'
-printf '设置示例：sudo smartdns-app-dns --youtube 1.1.1.1\n'
+"$BIN_PATH" "${APP_ARGS[@]}"

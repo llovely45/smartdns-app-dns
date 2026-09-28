@@ -10,29 +10,48 @@ CONFIG_DIR="/etc/smartdns-app-dns"
 EXTENSION_DIR="${SMARTDNS_APP_DNS_EXTENSION_DIR:-$CONFIG_DIR/apps.d}"
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 FALLBACK_DNS="1.1.1.1"
+AKILE_DNS_SOURCE_URL="https://raw.githubusercontent.com/akile-network/aktools/refs/heads/main/akdns.sh"
+AKILE_TEST_DOMAIN="www.google.com"
+AKILE_EMBEDDED_DNS=(66.66.66.66 45.207.157.146 108.160.138.51 139.180.133.239 45.76.83.113 45.76.71.83 45.63.99.176 166.0.199.207)
 
 declare -A APP_DOMAINS=()
 declare -A DOMAIN_OWNER=()
 declare -A REQUESTED_DNS=()
+declare -A REQUESTED_SOURCE=()
+declare -A PREVIOUS_DNS=()
+declare -A PREVIOUS_SOURCE=()
+declare -A FINAL_DNS=()
+declare -A FINAL_SOURCE=()
+declare -A FINAL_TRANSPORT=()
+declare -A APP_ALIASES=(
+  [openai]=chatgpt
+  [gemini]=google-ai
+  [max]=hbo-max
+  [copilot]=microsoft-copilot
+)
 declare -a REQUEST_ORDER=()
+declare -a APP_ORDER=()
 
 usage() {
   cat <<'EOF'
 SmartDNS App DNS — 为指定应用配置独立上游 DNS
 
 用法:
-  smartdns-app-dns --youtube 1.1.1.1 [--netflix 8.8.8.8 ...]
+  smartdns-app-dns [--youtube 1.1.1.1] [--netflix akile ...]
   smartdns-app-dns --list
 
 选项:
-  --<应用名> <IPv4|IPv6>  设置该应用的上游 DNS，可同时设置多个
+  --<应用名> <IPv4|IPv6|akile>  覆盖该应用的首选 DNS，可同时设置多个
+  --<应用名> akile        重置该应用为 Akile 自动选出的 DNS
   --config <路径>         指定 SmartDNS 配置文件
   --no-restart            写入后不重启 SmartDNS
   --dry-run               展示将要写入的差异，不修改文件
-  --list                  列出应用名和域名
+  --list                  列出内置应用名和域名
   -h, --help              显示帮助
 
-应用 DNS 无响应时，SmartDNS 会按重试逻辑回落到 1.1.1.1。
+不带应用参数时会为清单中的所有应用生成路由。默认首选 DNS 为 Akile
+节点测速结果；指定 IP 的应用使用该 IP。两种情况均以 1.1.1.1 为回落 DNS。
+已设置的自定义 DNS 会保留；使用 --<应用名> akile 可恢复自动选择。
 
 默认检测路径:
   /etc/smartdns/smartdns.conf
@@ -42,6 +61,7 @@ SmartDNS App DNS — 为指定应用配置独立上游 DNS
 
 可在 /etc/smartdns-app-dns/apps.d/*.tsv 中添加自定义应用。
 也可通过 SMARTDNS_CONFIG 环境变量指定配置文件。
+旧参数 --openai、--gemini、--max 和 --copilot 仍分别映射到 ChatGPT、Google AI、HBO Max 和 Microsoft Copilot。
 EOF
 }
 
@@ -73,7 +93,8 @@ load_catalog_file() {
     [[ "$line" == *'|'* && "${line#*|}" != *'|'* ]] || die "清单格式错误：$file 中的行应为 slug|domain1,domain2"
     slug="${line%%|*}"
     domains="${line#*|}"
-    [[ "$slug" =~ ^[a-z][a-z0-9-]*$ ]] || die "清单中的应用名无效：$slug"
+    [[ "$slug" =~ ^[a-z0-9][a-z0-9-]*$ ]] || die "清单中的应用名无效：$slug"
+    [[ -z "${APP_ALIASES[$slug]:-}" ]] || die "应用名 $slug 是保留的旧参数别名，请使用 ${APP_ALIASES[$slug]}"
     [[ -n "$domains" ]] || die "应用 $slug 没有配置域名"
     [[ -z "${APP_DOMAINS[$slug]:-}" ]] || die "应用名重复：$slug"
     IFS=',' read -r -a domain_list <<< "$domains"
@@ -108,9 +129,108 @@ valid_dns_address() {
   return 1
 }
 
+fetch_url() {
+  local url="$1" output="$2"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL --connect-timeout 5 --max-time 20 "$url" -o "$output"
+  elif command -v wget >/dev/null 2>&1; then
+    wget -q -T 20 "$url" -O "$output"
+  else
+    return 1
+  fi
+}
+
+parse_akile_script_dns_list() {
+  local file="$1" line address in_list=0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    if (( ! in_list )); then
+      [[ "$line" =~ ^[[:space:]]*DNS_LIST=\([[:space:]]*$ ]] || continue
+      in_list=1
+      continue
+    fi
+    [[ "$line" =~ ^[[:space:]]*\)[[:space:]]*$ ]] && break
+    if [[ "$line" =~ \"([^\"]+)\" ]]; then
+      address="${BASH_REMATCH[1]}"
+      valid_dns_address "$address" && printf '%s\n' "$address"
+    fi
+  done < "$file"
+}
+
+probe_akile_candidates() {
+  local transport="$1" index=0 address probe_file pid output latency best_line="" best_latency=999999
+  local -a pids=()
+  shift
+  for address in "$@"; do
+    ((index += 1))
+    probe_file="$WORK_DIR/akile-${transport}-${index}.result"
+    rm -f -- "$probe_file" "$probe_file.tmp"
+    (
+      local -a dig_args=(+time=1 +tries=1 +noall +answer +stats)
+      [[ "$transport" == tcp ]] && dig_args+=(+tcp)
+      output="$(dig "${dig_args[@]}" "$AKILE_TEST_DOMAIN" "@$address" 2>/dev/null || true)"
+      if awk 'NF && $0 !~ /^;;/ { found = 1 } END { exit !found }' <<< "$output"; then
+        latency="$(sed -n 's/^;; Query time: \([0-9][0-9]*\) msec.*/\1/p' <<< "$output" | head -n 1)"
+        [[ "$latency" =~ ^[0-9]+$ ]] || latency=999999
+        printf '%s|%s|%s\n' "$latency" "$address" "$transport" > "$probe_file.tmp"
+        mv -f -- "$probe_file.tmp" "$probe_file"
+      fi
+    ) &
+    pids+=("$!")
+  done
+  for pid in "${pids[@]}"; do
+    wait "$pid" || true
+  done
+
+  for probe_file in "$WORK_DIR"/akile-"$transport"-*.result; do
+    [[ -f "$probe_file" ]] || continue
+    IFS='|' read -r latency address _ <<< "$(cat "$probe_file")"
+    [[ "$latency" =~ ^[0-9]+$ ]] || continue
+    latency=$((10#$latency))
+    if [[ -z "$best_line" ]] || ((latency < best_latency)); then
+      best_latency="$latency"
+      best_line="$latency|$address|$transport"
+    fi
+  done
+  [[ -n "$best_line" ]] || return 1
+  printf '%s\n' "$best_line"
+}
+
+select_akile_dns() {
+  local source_file="$WORK_DIR/akile-source.sh" line address latency
+  local -a candidates=()
+  AKILE_DNS=""
+  AKILE_TRANSPORT=""
+
+  if fetch_url "$AKILE_DNS_SOURCE_URL" "$source_file" 2>/dev/null; then
+    mapfile -t candidates < <(parse_akile_script_dns_list "$source_file")
+  fi
+  if ((${#candidates[@]} == 0)); then
+    candidates=("${AKILE_EMBEDDED_DNS[@]}")
+  fi
+
+  if ! command -v dig >/dev/null 2>&1; then
+    AKILE_DNS="${candidates[0]}"
+    printf '未找到 dig，使用 Akile 候选列表首个节点：%s\n' "$AKILE_DNS"
+    return 0
+  fi
+
+  if line="$(probe_akile_candidates udp "${candidates[@]}")"; then
+    :
+  elif line="$(probe_akile_candidates tcp "${candidates[@]}")"; then
+    :
+  else
+    AKILE_DNS="${candidates[0]}"
+    printf 'Akile 节点测速均未收到有效答复，使用候选列表首个节点：%s\n' "$AKILE_DNS" >&2
+    return 0
+  fi
+
+  IFS='|' read -r latency AKILE_DNS AKILE_TRANSPORT <<< "$line"
+  printf 'Akile DNS 测速选择：%s（%s，%s ms）\n' "$AKILE_DNS" "${AKILE_TRANSPORT^^}" "$latency"
+}
+
 print_apps() {
   local slug
-  printf '可用应用参数（DNS 支持 IPv4 或 IPv6）：\n'
+  printf '可用应用参数（DNS 支持 IPv4、IPv6 或 akile）：\n'
   for slug in "${!APP_DOMAINS[@]}"; do
     printf '  --%-12s %s\n' "$slug" "${APP_DOMAINS[$slug]}"
   done | sort
@@ -280,13 +400,22 @@ while (($# > 0)); do
         shift 2
       fi
       slug="${flag#--}"
-      [[ "$slug" =~ ^[a-z][a-z0-9-]*$ ]] || die "无效的应用参数：$flag"
+      [[ "$slug" =~ ^[a-z0-9][a-z0-9-]*$ ]] || die "无效的应用参数：$flag"
+      slug="${APP_ALIASES[$slug]:-$slug}"
       [[ -n "${APP_DOMAINS[$slug]:-}" ]] || die "未知应用参数：$flag（使用 --list 查看，或添加 apps.d 清单）"
-      valid_dns_address "$value" || die "DNS 地址格式无效：$value（只接受 IPv4 或 IPv6）"
-      if [[ -z "${REQUESTED_DNS[$slug]:-}" ]]; then
+      value="${value,,}"
+      if [[ "$value" == akile ]]; then
+        source="akile"
+        value=""
+      else
+        valid_dns_address "$value" || die "DNS 地址格式无效：$value（只接受 IPv4、IPv6 或 akile）"
+        source="custom"
+      fi
+      if [[ -z "${REQUESTED_SOURCE[$slug]:-}" ]]; then
         REQUEST_ORDER+=("$slug")
       fi
       REQUESTED_DNS["$slug"]="$value"
+      REQUESTED_SOURCE["$slug"]="$source"
       ;;
     *)
       die "无法识别的参数：$arg"
@@ -299,7 +428,9 @@ if ((LIST_ONLY)); then
   print_apps
   exit 0
 fi
-((${#REQUEST_ORDER[@]} > 0)) || { usage >&2; exit 2; }
+
+mapfile -t APP_ORDER < <(printf '%s\n' "${!APP_DOMAINS[@]}" | LC_ALL=C sort)
+((${#APP_ORDER[@]} > 0)) || die "应用清单为空"
 
 if [[ -n "$CONFIG_ARG" ]]; then
   [[ -f "$CONFIG_ARG" ]] || die "SmartDNS 配置文件不存在：$CONFIG_ARG"
@@ -333,24 +464,94 @@ CONFIG_PARENT="$(dirname -- "$CONFIG_PATH")"
 WORK_DIR="$(mktemp -d "$CONFIG_PARENT/.smartdns-app-dns.XXXXXX")" || die "无法在配置目录创建临时文件：$CONFIG_PARENT"
 trap cleanup EXIT
 REQUEST_FILE="$WORK_DIR/requested.tsv"
+LEGACY_FILE="$WORK_DIR/legacy.tsv"
+STATE_FILE="$WORK_DIR/previous.tsv"
 NEW_CONFIG="$WORK_DIR/smartdns.conf"
 cp -p -- "$CONFIG_PATH" "$NEW_CONFIG"
-for slug in "${REQUEST_ORDER[@]}"; do
-  printf '%s|%s|%s\n' "$slug" "${REQUESTED_DNS[$slug]}" "${APP_DOMAINS[$slug]}"
+printf '%s\n' openai gemini max copilot > "$LEGACY_FILE"
+
+awk '
+  function emit_state() {
+    if (in_block && slug != "" && dns != "")
+      printf "%s|%s|%s\n", slug, source == "akile" ? "akile" : "custom", dns
+  }
+  /^# BEGIN smartdns-app-dns:/ {
+    slug = substr($0, length("# BEGIN smartdns-app-dns:") + 1)
+    in_block = 1
+    source = ""
+    dns = ""
+    next
+  }
+  /^# END smartdns-app-dns:/ {
+    end_slug = substr($0, length("# END smartdns-app-dns:") + 1)
+    if (in_block && end_slug == slug)
+      emit_state()
+    in_block = 0
+    slug = source = dns = ""
+    next
+  }
+  in_block && $0 ~ /^# smartdns-app-dns:primary-source=/ {
+    source = $0
+    sub(/^# smartdns-app-dns:primary-source=/, "", source)
+    next
+  }
+  in_block && $1 == "server" && index($0, "-group appdns_" slug) && $0 !~ /-fallback/ {
+    dns = $2
+  }
+  END {
+    if (in_block)
+      emit_state()
+  }
+' "$CONFIG_PATH" > "$STATE_FILE"
+
+while IFS='|' read -r old_slug old_source old_dns; do
+  [[ -n "$old_slug" ]] || continue
+  slug="${APP_ALIASES[$old_slug]:-$old_slug}"
+  [[ -n "${APP_DOMAINS[$slug]:-}" ]] || continue
+  valid_dns_address "$old_dns" || continue
+  PREVIOUS_DNS["$slug"]="$old_dns"
+  PREVIOUS_SOURCE["$slug"]="$old_source"
+done < "$STATE_FILE"
+
+select_akile_dns
+for slug in "${APP_ORDER[@]}"; do
+  if [[ -n "${REQUESTED_SOURCE[$slug]:-}" ]]; then
+    FINAL_SOURCE["$slug"]="${REQUESTED_SOURCE[$slug]}"
+    if [[ "${REQUESTED_SOURCE[$slug]}" == custom ]]; then
+      FINAL_DNS["$slug"]="${REQUESTED_DNS[$slug]}"
+      FINAL_TRANSPORT["$slug"]="udp"
+    else
+      FINAL_DNS["$slug"]="$AKILE_DNS"
+      FINAL_TRANSPORT["$slug"]="${AKILE_TRANSPORT:-udp}"
+    fi
+  elif [[ "${PREVIOUS_SOURCE[$slug]:-}" == custom && -n "${PREVIOUS_DNS[$slug]:-}" ]]; then
+    FINAL_SOURCE["$slug"]="custom"
+    FINAL_DNS["$slug"]="${PREVIOUS_DNS[$slug]}"
+    FINAL_TRANSPORT["$slug"]="udp"
+  else
+    FINAL_SOURCE["$slug"]="akile"
+    FINAL_DNS["$slug"]="$AKILE_DNS"
+    FINAL_TRANSPORT["$slug"]="${AKILE_TRANSPORT:-udp}"
+  fi
+  printf '%s|%s|%s|%s|%s\n' \
+    "$slug" "${FINAL_DNS[$slug]}" "${APP_DOMAINS[$slug]}" \
+    "${FINAL_SOURCE[$slug]}" "${FINAL_TRANSPORT[$slug]}"
 done > "$REQUEST_FILE"
 
-if ! awk -v reqfile="$REQUEST_FILE" -v fallback_dns="$FALLBACK_DNS" '
+if ! awk -v reqfile="$REQUEST_FILE" -v legacyfile="$LEGACY_FILE" -v fallback_dns="$FALLBACK_DNS" '
   BEGIN {
     begin_prefix = "# BEGIN smartdns-app-dns:"
     end_prefix = "# END smartdns-app-dns:"
     while ((getline request < reqfile) > 0) {
       count = split(request, fields, "|")
-      if (count != 3) {
+      if (count != 5) {
         print "请求清单格式错误" > "/dev/stderr"
         exit 2
       }
       slug = fields[1]
       dns[slug] = fields[2]
+      source[slug] = fields[4]
+      transport[slug] = fields[5]
       order[++app_count] = slug
       requested[slug] = 1
       group_name = sprintf("appdns_%s", slug)
@@ -363,12 +564,17 @@ if ! awk -v reqfile="$REQUEST_FILE" -v fallback_dns="$FALLBACK_DNS" '
       }
     }
     close(reqfile)
+    while ((getline legacy_slug < legacyfile) > 0) {
+      legacy[legacy_slug] = 1
+      target_group[sprintf("appdns_%s", legacy_slug)] = 1
+    }
+    close(legacyfile)
   }
   {
     line = $0
     if (index(line, begin_prefix) == 1) {
       marker_slug = substr(line, length(begin_prefix) + 1)
-      if (requested[marker_slug]) {
+      if (requested[marker_slug] || legacy[marker_slug]) {
         skipping = 1
         skipped_slug = marker_slug
         next
@@ -406,12 +612,16 @@ if ! awk -v reqfile="$REQUEST_FILE" -v fallback_dns="$FALLBACK_DNS" '
       exit 3
     }
     printf "\n"
-    printf "# Generated by smartdns-app-dns. Edit apps.tsv to change the domain list.\n"
+    printf "# Generated by smartdns-app-dns. Edit apps.tsv or apps.d to change the domain list.\n"
     for (app = 1; app <= app_count; app++) {
       slug = order[app]
       group_name = sprintf("appdns_%s", slug)
       printf "# BEGIN smartdns-app-dns:%s\n", slug
-      printf "server %s -group %s -exclude-default-group\n", dns[slug], group_name
+      printf "# smartdns-app-dns:primary-source=%s\n", source[slug]
+      printf "server %s -group %s -exclude-default-group", dns[slug], group_name
+      if (transport[slug] == "tcp")
+        printf " -tcp"
+      printf "\n"
       if (dns[slug] != fallback_dns)
         printf "server %s -group %s -exclude-default-group -fallback\n", fallback_dns, group_name
       for (i = 1; i <= domain_count[slug]; i++) {
@@ -453,8 +663,10 @@ fi
 
 printf '已更新 %s\n' "$CONFIG_PATH"
 printf '原配置备份：%s\n' "$BACKUP_PATH"
+printf '已写入 %s 个应用规则；Akile 默认节点：%s；失败回落：%s\n' \
+  "${#APP_ORDER[@]}" "$AKILE_DNS" "$FALLBACK_DNS"
 for slug in "${REQUEST_ORDER[@]}"; do
-  printf '  --%-12s %s  (group: appdns_%s)\n' "$slug" "${REQUESTED_DNS[$slug]}" "$slug"
+  printf '  --%-34s %s（%s）\n' "$slug" "${FINAL_DNS[$slug]}" "${FINAL_SOURCE[$slug]}"
 done
 
 if ((DO_RESTART)); then

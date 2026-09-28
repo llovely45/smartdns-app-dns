@@ -1,108 +1,172 @@
 # SmartDNS App DNS
 
-给不同应用指定不同的 SmartDNS 上游 DNS。命令会为应用创建独立的 SmartDNS group，并把清单中的域名路由到对应 group。
+为不同应用生成独立的 SmartDNS 上游组。内置应用默认使用测速选出的 Akile DNS，并在 SmartDNS 上配置 `1.1.1.1` 回落；命令行传入某个应用的 DNS 后，该应用改用指定地址，其他应用仍使用 Akile。
 
-## 一键安装并设置
+## 一键安装并应用默认规则
 
-下面命令会先检查 SmartDNS。若系统尚未安装，会从 SmartDNS 官方 GitHub Release 下载适配当前系统和架构的安装包并安装；然后安装 `smartdns-app-dns`，最后把 YouTube 的上游 DNS 设为 `1.1.1.1`：
+在 Linux VPS 上运行以下命令，会自动安装 SmartDNS（如果尚未安装）、安装本工具，并为清单中的全部应用写入默认规则：
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/llovely45/smartdns-app-dns/main/install.sh | sudo bash -s -- --youtube 1.1.1.1
+curl -fsSL https://raw.githubusercontent.com/llovely45/smartdns-app-dns/main/install.sh | sudo bash
 ```
 
-一次设置多个应用：
+指定一个或多个应用的首选 DNS：
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/llovely45/smartdns-app-dns/main/install.sh | sudo bash -s -- \
   --youtube 1.1.1.1 \
-  --netflix 8.8.8.8 \
-  --openai 9.9.9.9
+  --chatgpt 8.8.8.8 \
+  --netflix 9.9.9.9
 ```
 
-安装 SmartDNS 和命令，稍后再配置：
+也可以用 `akile` 把某应用恢复为自动选择的 Akile DNS：
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/llovely45/smartdns-app-dns/main/install.sh | sudo bash
-sudo smartdns-app-dns --youtube 1.1.1.1
+sudo smartdns-app-dns --youtube akile
 ```
 
-DNS 参数接受 IPv4 或 IPv6 地址。可以先用 `sudo smartdns-app-dns --list` 查看应用和域名清单。
+只安装 SmartDNS 和本工具，不写入应用规则：
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/llovely45/smartdns-app-dns/main/install.sh | sudo bash -s -- --install-only
+```
+
+查看可用应用参数和域名：
+
+```sh
+sudo smartdns-app-dns --list
+```
+
 目标系统需要 Bash 4 或更新版本。
 
-## 安装 SmartDNS
+## Akile 节点与回落方式
 
-- 如果检测到已有 SmartDNS 程序、软件包或服务，安装器会跳过 SmartDNS 安装，并使用现有配置。
-- Debian/Ubuntu 优先使用 SmartDNS 官方 Release 中匹配 CPU 架构的 `.deb` 包，通过 `apt-get` 安装依赖；不会运行 `apt-get update`，也不会升级系统软件。
-- 其他 Linux 发行版使用官方通用 Linux 压缩包及其自带安装脚本。当前 Release 没有适配包的系统或架构会明确报错。
-- 安装包会按 GitHub Release API 提供的 SHA-256 摘要校验；校验失败时停止安装。
-- 如果程序或服务已存在，但找不到 SmartDNS 配置文件，仍会停止并提示使用 `--config`；不会重复安装或猜测其他配置。
-- 安装 SmartDNS 不会修改 `/etc/resolv.conf`。单独运行 `smartdns-app-dns` 命令只更新已有 SmartDNS 配置，不负责安装 SmartDNS。
+- 工具从 Akile 的公开 `akdns.sh` 中只读取 `DNS_LIST` 文本，不执行该脚本，也不修改或锁定 `/etc/resolv.conf`。
+- 有 `dig` 时，并发测速 Akile 节点；UDP 都没有有效答复时再尝试 TCP，并按结果选择最快节点。TCP 节点会在 SmartDNS 配置中标记为 `-tcp`。
+- 没有 `dig` 时使用 Akile 候选列表首个地址。Akile 脚本暂时无法读取时，使用工具内置的候选地址列表。
+- 每个应用的首选上游无响应时，SmartDNS 可按其重试逻辑使用 `1.1.1.1 -fallback`。首选上游返回有效答复（例如 `NXDOMAIN`）时，不保证触发回落。
+- 自定义 DNS 会保存在工具生成的托管区块中；以后更新其他应用时会继续保留。指定 `--<应用名> akile` 可移除该应用的自定义覆盖。
 
-## 工作方式
+## 安装与配置行为
 
-- 自动查找常见配置路径，并尝试从 systemd 服务、运行中的 SmartDNS 进程和 `/etc`、`/usr/local/etc`、`/opt` 下的 SmartDNS 配置文件定位实际配置。也可用 `--config /path/to/smartdns.conf` 或 `SMARTDNS_CONFIG=/path/to/smartdns.conf` 指定文件。
-- 找到配置后，先创建带时间戳的 `.bak.*` 备份，再更新所选应用的域名路由；已有应用路由会切换到新 group，缺少的应用规则会自动追加。
-- 修改 `/etc` 下的配置时会先尝试 `chattr -i`，写入后再执行 `chattr +i`。若现有 immutable 锁无法解开会停止；若系统没有 `chattr` 会提示无法锁定后继续。工具不会修改 `/etc/resolv.conf`。
-- 每个应用使用独立的 `appdns_<应用名>` group：你指定的 DNS 是首选上游，`1.1.1.1` 作为 SmartDNS `-fallback` 备用上游。首选 DNS 无响应时，SmartDNS 重试时会使用备用 DNS；备用 DNS 不参与首次查询。若首选地址本身就是 `1.1.1.1`，只生成一次。
-- 主 DNS 返回有效答复但内容不符合预期（例如 `NXDOMAIN`）时，不一定会触发回落；回落由 SmartDNS 的上游失败与重试逻辑决定。
-- 默认重启 `smartdns` 服务使配置生效。可用 `--no-restart` 跳过；`--dry-run` 只显示差异，不写文件也不重启。
-- 如果安装后仍没有 SmartDNS 配置文件，命令会报错并提示如何指定路径。安装器不会修改系统 `resolv.conf`。
+- 安装器检测到 SmartDNS 未安装时，会从 SmartDNS 官方 GitHub Release 下载适配系统架构的安装包，并校验 SHA-256。已有 SmartDNS 时跳过安装。
+- Debian/Ubuntu 优先安装官方 `.deb`；其他 Linux 使用官方通用 Linux 安装包。安装器不会运行 `apt-get update`，也不会升级系统软件。
+- 每次运行安装器时会更新本工具和内置 `apps.tsv`。无参数运行安装器或直接运行 `smartdns-app-dns` 会应用清单中所有应用。
+- 用户传入的应用 DNS 会覆盖对应应用的 Akile 默认值；已有自定义覆盖也会保留。新加入清单的应用默认使用 Akile。
+- 自动定位常见 SmartDNS 配置路径，也会检查 systemd/运行进程和 `/etc`、`/usr/local/etc`、`/opt`。可用 `--config /path/to/smartdns.conf` 或 `SMARTDNS_CONFIG=/path/to/smartdns.conf` 指定配置文件。
+- 写入前会创建带时间戳的 `.bak.*` 备份。修改 `/etc` 下的配置时先尝试 `chattr -i`，完成后再尝试 `chattr +i`。不会修改 `/etc/resolv.conf`。
+- 默认重启 SmartDNS 服务使配置生效。`--no-restart` 可跳过重启；`--dry-run` 只显示差异，不写文件也不重启。
 
-升级后，重新运行一键安装命令并传入需要更新的应用参数，即可为这些应用写入 `1.1.1.1` 备用 DNS。例如：
-
-```sh
-curl -fsSL https://raw.githubusercontent.com/llovely45/smartdns-app-dns/main/install.sh | sudo bash -s -- --youtube 1.1.1.1 --netflix 8.8.8.8
-```
+如果现有 SmartDNS 已安装但没有配置文件，命令会报错并提示使用 `--config` 指定路径；它不会猜测或覆盖其他 DNS 配置文件。
 
 ## 支持的应用
 
-| 参数 | 域名来源 |
+参数由应用 slug 自动生成；应用域名集中维护在仓库根目录的 [`apps.tsv`](apps.tsv)。下表列出内置参数：
+
+| 应用 | 参数 |
 | --- | --- |
-| `--youtube` | YouTube 视频、图片和 API 域名 |
-| `--tiktok` | TikTok 及其 CDN 域名 |
-| `--netflix` | Netflix 播放、图片和 CDN 域名 |
-| `--disney-plus` | Disney+ 相关域名 |
-| `--spotify` | Spotify 相关域名 |
-| `--max` | Max / HBO 相关域名 |
-| `--openai` | OpenAI、ChatGPT 和 Sora 域名 |
-| `--gemini` | Gemini、AI Studio 和相关 Google API 域名 |
-| `--claude` | Claude / Anthropic 域名 |
-| `--copilot` | Microsoft Copilot 域名 |
+| Netflix | `--netflix` |
+| Disney+ | `--disney-plus` |
+| ChatGPT | `--chatgpt` |
+| Sora | `--sora` |
+| Apple AI | `--apple-ai` |
+| Meta AI | `--meta-ai` |
+| Spotify | `--spotify` |
+| Google Search | `--google-search` |
+| YouTube | `--youtube` |
+| Google AI | `--google-ai` |
+| Google Play | `--google-play` |
+| 动画疯 | `--anime-gamer` |
+| Bilibili | `--bilibili` |
+| TikTok | `--tiktok` |
+| Claude | `--claude` |
+| HotStar | `--hotstar` |
+| DAZN | `--dazn` |
+| Abema TV | `--abema-tv` |
+| HBO MAX | `--hbo-max` |
+| KKTV | `--kktv` |
+| Line TV | `--line-tv` |
+| Ofiii | `--ofiii` |
+| MyTVSuper | `--mytv-super` |
+| Viu.TV | `--viu-tv` |
+| Viu.com | `--viu-com` |
+| TVBAnywhere+ | `--tvb-anywhere-plus` |
+| HOY TV | `--hoy-tv` |
+| Hami Video | `--hami-video` |
+| CatchPlay+ | `--catchplay-plus` |
+| Friday Video | `--friday-video` |
+| 4GTV | `--4gtv` |
+| DMM | `--dmm` |
+| Hulu Japan | `--hulu-japan` |
+| NicoNico | `--niconico` |
+| NHK+ | `--nhk-plus` |
+| U-NEXT | `--u-next` |
+| TVer | `--tver` |
+| D Anime Store | `--d-anime-store` |
+| J:com On Demand | `--jcom-on-demand` |
+| Pretty Derby Japan | `--pretty-derby-japan` |
+| VideoMarket | `--video-market` |
+| FOD (Fuji TV) | `--fod` |
+| Radiko | `--radiko` |
+| Karaoke@DAM | `--karaoke-dam` |
+| Lemino | `--lemino` |
+| MGStage | `--mgstage` |
+| AnimeFesta | `--animefesta` |
+| Telasa | `--telasa` |
+| WOWOW | `--wowow` |
+| Rakuten TV JP | `--rakuten-tv-jp` |
+| Princess Connect Re:Dive Japan | `--princess-connect-redive-japan` |
+| Project Sekai: Colorful Stage | `--project-sekai` |
+| Rakuten MAGAZINE | `--rakuten-magazine` |
+| Mora | `--mora` |
+| music.jp | `--music-jp` |
+| EroGameSpace | `--erogamespace` |
+| WATCHA | `--watcha` |
+| Reddit | `--reddit` |
+| SD Gundam G Generation Eternal | `--sd-gundam-g-generation-eternal` |
+| Wikipedia | `--wikipedia` |
+| iQyi Oversea | `--iqyi-oversea` |
+| Amazon Prime Video | `--amazon-prime-video` |
+| Microsoft Copilot | `--microsoft-copilot` |
+| MyVideo | `--myvideo` |
+| Discovery+ | `--discovery-plus` |
+| Paramount+ | `--paramount-plus` |
 
-域名列表来自仓库根目录的 [`apps.tsv`](apps.tsv)，按应用逐行维护。
+旧参数 `--openai`、`--gemini`、`--max`、`--copilot` 仍可使用，分别映射到 ChatGPT、Google AI、HBO MAX、Microsoft Copilot。
 
-## 添加自定义应用
+域名规则是可编辑的起始清单。个别服务可能使用新的 API/CDN 域名，可继续把域名加到 `apps.tsv` 对应行；域名不会在不同应用间重复定义。
 
-安装后，在 `/etc/smartdns-app-dns/apps.d/` 下创建任意 `.tsv` 文件，每行使用 `应用参数名|域名1,域名2` 格式：
+## 添加或更新应用规则
+
+直接修改仓库根目录的 `apps.tsv`，每行格式为 `应用参数名|域名1,域名2`。将修改推送到 `main` 后，在 VPS 上重新运行一键安装命令，安装器会更新内置清单，新增 slug 也会自动成为 `--<slug>` 参数。
+
+也可以在 VPS 的 `/etc/smartdns-app-dns/apps.d/` 下创建本地扩展文件：
 
 ```sh
 sudo tee /etc/smartdns-app-dns/apps.d/custom.tsv >/dev/null <<'EOF'
-myvideo|video.example.com,api.video.example.com
+myvideo-extra|video.example.com,api.video.example.com
 EOF
 ```
 
-然后就可以使用新增的参数：
+随后可运行：
 
 ```sh
-sudo smartdns-app-dns --myvideo 1.1.1.1
+sudo smartdns-app-dns --myvideo-extra 9.9.9.9
 ```
 
-应用名使用小写字母开头，只包含小写字母、数字和连字符；域名需要小写。每个应用名和域名只能定义一次。自定义清单在工具更新时保留。
+应用参数名以小写字母或数字开头，只能包含小写字母、数字和连字符；域名使用小写。应用名与域名不能重复定义。仓库内的应用清单更新不会覆盖本地 `apps.d` 文件。
 
 ## 常用选项
 
 ```text
---<应用名> <IPv4|IPv6>  设置一个应用；可重复传入多个应用
---list                  列出已知应用
+--<应用名> <IPv4|IPv6>  设置该应用自定义首选 DNS
+--<应用名> akile        恢复 Akile 自动 DNS
 --config <路径>         指定 SmartDNS 配置文件
+--list                  列出应用参数与域名
 --dry-run               预览差异
 --no-restart            更新后不重启服务
 --help                  显示帮助
 ```
-
-## 开发与发布
-
-`apps.tsv` 是可扩展的应用/域名清单；新增内置应用时增加一行即可，参数会自动从应用名生成。修改后通过仓库的 `main` 分支即可更新一键安装脚本。
 
 ## License
 
