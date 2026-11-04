@@ -41,10 +41,11 @@ sudo smartdns-app-dns --list
 
 ## Akile 节点与回落方式
 
-- 工具从 Akile 的公开 `akdns.sh` 中只读取 `DNS_LIST` 文本，不执行该脚本，也不修改或锁定 `/etc/resolv.conf`。
+- 工具从 Akile 的公开 `akdns.sh` 中只读取 `DNS_LIST` 文本，不执行该脚本。安装器配置并重启 SmartDNS 后，会独立验证 `127.0.0.1:53` 是否返回有效 DNS A 记录；验证通过后才切换系统 resolver。
 - 有 `dig` 时，并发测速 Akile 节点；UDP 都没有有效答复时再尝试 TCP，并按结果选择最快节点。TCP 节点会在 SmartDNS 配置中标记为 `-tcp`。
 - 没有 `dig` 时使用 Akile 候选列表首个地址。Akile 脚本暂时无法读取时，使用工具内置的候选地址列表。
 - 每个应用的首选上游无响应时，SmartDNS 可按其重试逻辑使用 `1.1.1.1 -fallback`。首选上游返回有效答复（例如 `NXDOMAIN`）时，不保证触发回落。
+- 不同应用共用相同地址、传输协议和回落属性的上游会合并为一条 `server` 声明，并加入相应的多个应用组，避免重复占用 SmartDNS 上游名额。写入前会检查最终配置中的上游条目数；超过 SmartDNS 的 64 条限制时拒绝更新，原配置保持不变。
 - 自定义 DNS 会保存在工具生成的托管区块中；以后更新其他应用时会继续保留。指定 `--<应用名> akile` 可移除该应用的自定义覆盖。
 
 ## 安装与配置行为
@@ -54,8 +55,8 @@ sudo smartdns-app-dns --list
 - 每次运行安装器时会更新本工具和内置 `apps.tsv`。无参数运行安装器或直接运行 `smartdns-app-dns` 会应用清单中所有应用。
 - 用户传入的应用 DNS 会覆盖对应应用的 Akile 默认值；已有自定义覆盖也会保留。新加入清单的应用默认使用 Akile。
 - 自动定位常见 SmartDNS 配置路径，也会检查 systemd/运行进程和 `/etc`、`/usr/local/etc`、`/opt`。可用 `--config /path/to/smartdns.conf` 或 `SMARTDNS_CONFIG=/path/to/smartdns.conf` 指定配置文件。
-- 写入前会创建带时间戳的 `.bak.*` 备份。修改 `/etc` 下的配置时先尝试 `chattr -i`，完成后再尝试 `chattr +i`。不会修改 `/etc/resolv.conf`。
-- 默认重启 SmartDNS 服务使配置生效。`--no-restart` 可跳过重启；`--dry-run` 只显示差异，不写文件也不重启。
+- 写入 SmartDNS 配置前会创建带时间戳的 `.bak.*` 备份；修改 `/etc` 下的 SmartDNS 配置时先尝试 `chattr -i`，完成后再尝试 `chattr +i`。安装器完成规则写入和服务重启后，会确认 `smartdns.service` 正在运行，并通过 `dig` 直连 `127.0.0.1:53` 查询 `youtube.com`。收到有效 A 记录后，再确保服务开机自启，然后才把 `/etc/resolv.conf` 原子替换为 `nameserver 127.0.0.1`（保留原有非 nameserver 行），用 `chattr +i`/`lsattr` 锁定并确认成功，同时创建带时间戳的原文件备份。原文件若为符号链接，备份保留该符号链接，活动配置会替换为普通文件。若没有 `systemctl`/`dig`、服务未运行、查询失败、无法确认锁定或锁定失败，安装器不会保留新的 DNS 指向，并会报错；锁定失败时会尝试恢复原 resolver。
+- 默认重启 SmartDNS 服务使配置生效。`--no-restart` 可跳过重启和系统 DNS 切换；`--dry-run` 只显示差异，不写文件、不重启也不切换系统 DNS。安装器参数 `--no-system-dns` 可仅跳过 `/etc/resolv.conf` 的切换，仍安装 SmartDNS 并应用规则。
 
 如果现有 SmartDNS 已安装但没有配置文件，命令会报错并提示使用 `--config` 指定路径；它不会猜测或覆盖其他 DNS 配置文件。
 
@@ -167,6 +168,8 @@ sudo smartdns-app-dns --myvideo-extra 9.9.9.9
 --no-restart            更新后不重启服务
 --help                  显示帮助
 ```
+
+安装器额外选项：`--no-system-dns` 保留当前系统 DNS，不修改或锁定 `/etc/resolv.conf`。如果后续需要手动解除系统 resolver 锁，可运行 `sudo chattr -i /etc/resolv.conf`。
 
 ## License
 

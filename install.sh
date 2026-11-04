@@ -9,11 +9,14 @@ BIN_DIR="/usr/local/bin"
 SHARE_DIR="/usr/local/share/smartdns-app-dns"
 BIN_PATH="$BIN_DIR/smartdns-app-dns"
 INSTALL_ONLY=0
+SYSTEM_DNS_ENABLED=1
 declare -a APP_ARGS=()
 
 for arg in "$@"; do
   if [[ "$arg" == --install-only ]]; then
     INSTALL_ONLY=1
+  elif [[ "$arg" == --no-system-dns ]]; then
+    SYSTEM_DNS_ENABLED=0
   else
     APP_ARGS+=("$arg")
   fi
@@ -245,6 +248,9 @@ TEMP_DIR="$(mktemp -d)"
 trap 'rm -rf -- "$TEMP_DIR"' EXIT
 fetch "$RAW_BASE/smartdns-app-dns.sh" "$TEMP_DIR/smartdns-app-dns.sh"
 fetch "$RAW_BASE/apps.tsv" "$TEMP_DIR/apps.tsv"
+fetch "$RAW_BASE/system-dns.sh" "$TEMP_DIR/system-dns.sh"
+# shellcheck source=system-dns.sh
+source "$TEMP_DIR/system-dns.sh"
 
 if smartdns_present; then
   printf '检测到已有 SmartDNS，跳过自动安装。\n'
@@ -274,3 +280,12 @@ if ((INSTALL_ONLY)); then
 fi
 
 "$BIN_PATH" "${APP_ARGS[@]}"
+
+if ((SYSTEM_DNS_ENABLED)) && system_dns_should_activate "${APP_ARGS[@]}"; then
+  if ! system_dns_activate /etc/resolv.conf youtube.com; then
+    printf '错误：SmartDNS 服务、DNS 查询或 resolver 锁定检查未通过，因此没有将系统 DNS 切换到 127.0.0.1。\n' >&2
+    exit 1
+  fi
+else
+  printf '按安装参数要求，跳过系统 DNS 切换。\n'
+fi
