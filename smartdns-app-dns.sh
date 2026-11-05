@@ -603,7 +603,7 @@ if ! awk -v reqfile="$REQUEST_FILE" -v legacyfile="$LEGACY_FILE" -v fallback_dns
     line = $0
     if (index(line, begin_prefix) == 1) {
       marker_slug = substr(line, length(begin_prefix) + 1)
-      if (marker_slug == "_shared-upstreams" || requested[marker_slug] || legacy[marker_slug]) {
+      if (marker_slug == "_global-fallback" || marker_slug == "_shared-upstreams" || requested[marker_slug] || legacy[marker_slug]) {
         skipping = 1
         skipped_slug = marker_slug
         next
@@ -650,6 +650,9 @@ if ! awk -v reqfile="$REQUEST_FILE" -v legacyfile="$LEGACY_FILE" -v fallback_dns
     } else if (last_output_line != "" && last_output_line != generated_header) {
       printf "\n"
     }
+    printf "# BEGIN smartdns-app-dns:_global-fallback\n"
+    printf "server %s -fallback\n", fallback_dns
+    printf "# END smartdns-app-dns:_global-fallback\n"
     printf "# BEGIN smartdns-app-dns:_shared-upstreams\n"
     for (server = 1; server <= server_count; server++) {
       key = server_order[server]

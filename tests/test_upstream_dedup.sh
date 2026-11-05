@@ -40,8 +40,8 @@ if ! run_tool --youtube 8.8.8.8 --config "$config" --no-restart > "$TMP_DIR/appl
   exit 1
 fi
 server_count="$(grep -cE '^server(-tcp|-tls|-https|-quic|-http3)?[[:space:]]' "$config" || true)"
-if [[ "$server_count" -ne 4 ]]; then
-  printf 'Expected 4 total upstream declarations (1 base + 3 deduplicated), found %s.\n' "$server_count" >&2
+if [[ "$server_count" -ne 5 ]]; then
+  printf 'Expected 5 total upstream declarations (1 base + 3 deduplicated + 1 global fallback), found %s.\n' "$server_count" >&2
   grep -nE '^server(-tcp|-tls|-https|-quic|-http3)?[[:space:]]' "$config" >&2 || true
   exit 1
 fi
@@ -49,7 +49,9 @@ fi
 shared_block_count="$(grep -c '^# BEGIN smartdns-app-dns:_shared-upstreams$' "$config" || true)"
 [[ "$shared_block_count" -eq 1 ]]
 grep -q '^server 8\.8\.8\.8 .*appdns_youtube' "$config"
-grep -q '^server 1\.1\.1\.1 .* -fallback' "$config"
+[[ "$(grep -c '^# BEGIN smartdns-app-dns:_global-fallback$' "$config" || true)" -eq 1 ]]
+[[ "$(grep -c '^# END smartdns-app-dns:_global-fallback$' "$config" || true)" -eq 1 ]]
+grep -A1 '^# BEGIN smartdns-app-dns:_global-fallback$' "$config" | grep -q '^server 1\.1\.1\.1 -fallback$'
 # Shared endpoints must still be assigned to each application's group.
 grep '^server 66\.66\.66\.66 ' "$config" | grep -q 'appdns_disney-plus.*appdns_netflix'
 grep '^server 1\.1\.1\.1 ' "$config" | grep -q 'appdns_disney-plus.*appdns_netflix'
@@ -64,19 +66,20 @@ if ! cmp -s "$TMP_DIR/first-result.conf" "$config"; then
   exit 1
 fi
 server_count="$(grep -cE '^server(-tcp|-tls|-https|-quic|-http3)?[[:space:]]' "$config" || true)"
-[[ "$server_count" -eq 4 ]]
+[[ "$server_count" -eq 5 ]]
 [[ "$(grep -c '^# BEGIN smartdns-app-dns:_shared-upstreams$' "$config" || true)" -eq 1 ]]
+[[ "$(grep -c '^# BEGIN smartdns-app-dns:_global-fallback$' "$config" || true)" -eq 1 ]]
 grep -q '^server 8\.8\.8\.8 .*appdns_youtube' "$config"
 
 # Exactly 64 configured upstreams are accepted.
 limit_config="$TMP_DIR/exact-limit.conf"
-for _ in $(seq 1 61); do printf 'server 192.0.2.53\n' >> "$limit_config"; done
+for _ in $(seq 1 60); do printf 'server 192.0.2.53\n' >> "$limit_config"; done
 run_tool --youtube 8.8.8.8 --config "$limit_config" --no-restart > "$TMP_DIR/limit.txt" 2>&1
 [[ "$(grep -cE '^server(-tcp|-tls|-https|-quic|-http3)?[[:space:]]' "$limit_config")" -eq 64 ]]
 
 # Do not write a configuration that still exceeds SmartDNS's 64-server limit.
 guard_config="$TMP_DIR/at-limit.conf"
-for _ in $(seq 1 62); do printf 'server 192.0.2.53\n' >> "$guard_config"; done
+for _ in $(seq 1 61); do printf 'server 192.0.2.53\n' >> "$guard_config"; done
 cp "$guard_config" "$TMP_DIR/guard-before.conf"
 if run_tool --youtube 8.8.8.8 --config "$guard_config" --no-restart > "$TMP_DIR/guard.txt" 2>&1; then
   printf "Expected generation to reject a result over SmartDNS’s 64-server limit.\n" >&2
