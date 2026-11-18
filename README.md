@@ -55,6 +55,7 @@ sudo smartdns-app-dns --list
 - 每次运行安装器时会更新本工具和内置 `apps.tsv`。无参数运行安装器或直接运行 `smartdns-app-dns` 会应用清单中所有应用。
 - 用户传入的应用 DNS 会覆盖对应应用的 Akile 默认值；已有自定义覆盖也会保留。新加入清单的应用默认使用 Akile。
 - 自动定位常见 SmartDNS 配置路径，也会检查 systemd/运行进程和 `/etc`、`/usr/local/etc`、`/opt`。可用 `--config /path/to/smartdns.conf` 或 `SMARTDNS_CONFIG=/path/to/smartdns.conf` 指定配置文件。
+- 检测到 `systemd-resolved` 占用 `127.0.0.53/.54:53` 时，会把主配置中的冲突通配监听自动收窄到本机 `127.0.0.1`/`::1`，并在写入前备份。现有具体网卡 IP 监听会保留；通配监听改为本机后，公网 DNS 客户端需配置具体网卡 IP 才能继续访问。由 `conf-file` 引入的配置文件需单独检查监听项。
 - 写入 SmartDNS 配置前会创建带时间戳的 `.bak.*` 备份；修改 `/etc` 下的 SmartDNS 配置时先尝试 `chattr -i`，完成后再尝试 `chattr +i`。安装器完成规则写入和服务重启后，会确认 `smartdns.service` 正在运行，并通过 `dig` 直连 `127.0.0.1:53` 查询 `youtube.com`。收到有效 A 记录后，再确保服务开机自启，然后才把 `/etc/resolv.conf` 原子替换为 `nameserver 127.0.0.1`（保留原有非 nameserver 行），用 `chattr +i`/`lsattr` 锁定并确认成功，同时创建带时间戳的原文件备份。原文件若为符号链接，备份保留该符号链接，活动配置会替换为普通文件。若没有 `systemctl`/`dig`、服务未运行、查询失败、无法确认锁定或锁定失败，安装器不会保留新的 DNS 指向，并会报错；锁定失败时会尝试恢复原 resolver。
 - 默认重启 SmartDNS 服务使配置生效。`--no-restart` 可跳过重启和系统 DNS 切换；`--dry-run` 只显示差异，不写文件、不重启也不切换系统 DNS。安装器参数 `--no-system-dns` 可仅跳过 `/etc/resolv.conf` 的切换，仍安装 SmartDNS 并应用规则。
 

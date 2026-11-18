@@ -229,6 +229,111 @@ select_akile_dns() {
   printf 'Akile DNS 测速选择：%s（%s，%s ms）\n' "$AKILE_DNS" "${AKILE_TRANSPORT^^}" "$latency"
 }
 
+systemd_resolved_has_stub_listener() {
+  local listeners=""
+  if command -v ss >/dev/null 2>&1; then
+    listeners="$(ss -H -lntup 'sport = :53' 2>/dev/null || true)"
+  elif command -v lsof >/dev/null 2>&1; then
+    listeners="$(lsof -nP -iTCP:53 -iUDP:53 2>/dev/null || true)"
+  else
+    return 1
+  fi
+
+  [[ "$listeners" == *systemd-resolv* ]] && \
+    { [[ "$listeners" == *127.0.0.53* ]] || [[ "$listeners" == *127.0.0.54* ]]; }
+}
+
+auto_localize_bind_for_systemd_resolved() {
+  local localized_config="$WORK_DIR/smartdns-resolved-bind.conf"
+  systemd_resolved_has_stub_listener || return 0
+
+  if ! awk '
+    function ipv6_wildcard(address) {
+      return address == "[::]" || address == "[::]:53"
+    }
+    function ipv4_wildcard(address) {
+      return address == ":" || address == ":53" || \
+        address == "0.0.0.0" || address == "0.0.0.0:53"
+    }
+    function resolved_stub_address(address) {
+      return address == "127.0.0.53" || address == "127.0.0.53:53" || \
+        address == "127.0.0.54" || address == "127.0.0.54:53"
+    }
+    function local_ipv4(address) {
+      return address == "127.0.0.1" || address == "127.0.0.1:53"
+    }
+    function rest_after_address(line, rest) {
+      rest = line
+      sub(/^[[:space:]]*/, "", rest)
+      sub(/^[^[:space:]]+[[:space:]]+[^[:space:]]+/, "", rest)
+      return rest
+    }
+    {
+      line = $0
+      trimmed = line
+      sub(/^[[:space:]]+/, "", trimmed)
+      if (trimmed == "" || trimmed ~ /^#/) {
+        print line
+        next
+      }
+
+      field_count = split(trimmed, fields, /[[:space:]]+/)
+      directive = fields[1]
+      if (directive !~ /^bind(-tcp|-tls|-https|-quic|-http3)?$/ || field_count < 2) {
+        print line
+        next
+      }
+
+      address = fields[2]
+      sub(/@.*/, "", address)
+      is_udp = directive == "bind"
+      is_tcp = directive == "bind-tcp"
+      if (is_udp) seen_udp = 1
+      if (is_tcp) seen_tcp = 1
+      if (is_udp && local_ipv4(address)) local_udp = 1
+      if (is_tcp && local_ipv4(address)) local_tcp = 1
+
+      if (ipv6_wildcard(address)) {
+        rest = rest_after_address(line)
+        printf "%s 127.0.0.1:53%s\n", directive, rest
+        printf "%s [::1]:53%s\n", directive, rest
+        if (is_udp) local_udp = 1
+        if (is_tcp) local_tcp = 1
+        next
+      }
+      if (ipv4_wildcard(address) || resolved_stub_address(address)) {
+        rest = rest_after_address(line)
+        printf "%s 127.0.0.1:53%s\n", directive, rest
+        if (is_udp) local_udp = 1
+        if (is_tcp) local_tcp = 1
+        next
+      }
+
+      print line
+    }
+    END {
+      if (!local_udp) {
+        if (!seen_udp) print "# smartdns-app-dns: local listeners for systemd-resolved"
+        print "bind 127.0.0.1:53"
+        if (!seen_udp) print "bind [::1]:53"
+      }
+      if (!local_tcp) {
+        if (!seen_udp && local_udp) print "# smartdns-app-dns: local listeners for systemd-resolved"
+        print "bind-tcp 127.0.0.1:53"
+        if (!seen_tcp) print "bind-tcp [::1]:53"
+      }
+    }
+  ' "$NEW_CONFIG" > "$localized_config"; then
+    die "检测到 systemd-resolved 占用 DNS 端口，但无法自动调整 SmartDNS 监听配置"
+  fi
+
+  if ! cmp -s -- "$NEW_CONFIG" "$localized_config"; then
+    cat -- "$localized_config" > "$NEW_CONFIG" || die "无法写入 SmartDNS 本机监听配置"
+    printf '检测到 systemd-resolved 占用 127.0.0.53/.54:53，已将 SmartDNS 冲突的通配监听改为本机地址。\n'
+    printf '公网/网卡的具体 IP 监听会保留；如需公网 DNS，请配置具体网卡 IP。\n'
+  fi
+}
+
 print_apps() {
   local slug
   printf '可用应用参数（DNS 支持 IPv4、IPv6 或 akile）：\n'
@@ -682,6 +787,8 @@ if ! awk -v reqfile="$REQUEST_FILE" -v legacyfile="$LEGACY_FILE" -v fallback_dns
 ' "$CONFIG_PATH" > "$NEW_CONFIG"; then
   die "无法生成配置更新；原配置没有被修改"
 fi
+
+auto_localize_bind_for_systemd_resolved
 
 server_entry_count="$(awk '
   $1 == "server" || $1 == "server-tcp" || $1 == "server-tls" || \
