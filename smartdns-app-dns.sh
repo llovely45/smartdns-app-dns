@@ -726,19 +726,101 @@ for slug in "${REQUEST_ORDER[@]}"; do
   printf '  --%-34s %s（%s）\n' "$slug" "${FINAL_DNS[$slug]}" "${FINAL_SOURCE[$slug]}"
 done
 
+show_restart_failure_details() {
+  local unit="$1" log_tail="" port_listeners=""
+  printf '\n--- %s 状态 ---\n' "$unit" >&2
+  systemctl --no-pager --full status "$unit" >&2 || true
+  if command -v journalctl >/dev/null 2>&1; then
+    printf '\n--- %s 最近 80 条日志 ---\n' "$unit" >&2
+    journalctl -u "$unit" -n 80 --no-pager >&2 || true
+  fi
+  if [[ -r /var/log/smartdns/smartdns.log ]]; then
+    printf '\n--- SmartDNS 日志：/var/log/smartdns/smartdns.log（最近 100 行）---\n' >&2
+    log_tail="$(tail -n 100 /var/log/smartdns/smartdns.log 2>/dev/null || true)"
+    printf '%s\n' "$log_tail" >&2
+  fi
+  printf '\n--- TCP/UDP 53 端口监听者 ---\n' >&2
+  if command -v ss >/dev/null 2>&1; then
+    port_listeners="$(ss -H -lntup 'sport = :53' 2>/dev/null || true)"
+  elif command -v lsof >/dev/null 2>&1; then
+    port_listeners="$(lsof -nP -iTCP:53 -iUDP:53 2>/dev/null || true)"
+  else
+    printf '系统未安装 ss 或 lsof，无法自动列出端口占用进程。\n' >&2
+  fi
+  if [[ -n "$port_listeners" ]]; then
+    printf '%s\n' "$port_listeners" >&2
+  fi
+
+  if [[ "$log_tail" == *'bind service [::]:53 failed, Address in use'* && \
+        "$port_listeners" == *systemd-resolve* ]]; then
+    printf '诊断：SmartDNS 的 [::]:53 双栈监听与 systemd-resolved 的 127.0.0.53/.54 监听冲突。若只供本机使用，可将 bind 改为 127.0.0.1:53；若需对外提供 DNS，请改为具体网卡地址，或在迁移系统 resolver 后再关闭 systemd-resolved stub。\n' >&2
+  fi
+}
+
+rollback_config_after_restart_failure() {
+  local restore_tmp="$WORK_DIR/restore.conf"
+  FAILED_CONFIG_PATH="${CONFIG_PATH}.failed.${timestamp}"
+  if [[ -e "$FAILED_CONFIG_PATH" ]]; then
+    FAILED_CONFIG_PATH="${FAILED_CONFIG_PATH}.$$"
+  fi
+
+  if cp -p -- "$CONFIG_PATH" "$FAILED_CONFIG_PATH"; then
+    printf '失败的新配置已保留：%s\n' "$FAILED_CONFIG_PATH" >&2
+  else
+    printf '警告：无法另存失败的新配置：%s\n' "$FAILED_CONFIG_PATH" >&2
+  fi
+
+  if [[ "$CONFIG_PATH" == /etc/* ]] && command -v chattr >/dev/null 2>&1; then
+    if ! chattr -i "$CONFIG_PATH" 2>/dev/null; then
+      printf '错误：无法解锁配置文件，未能回滚；原配置备份：%s\n' "$BACKUP_PATH" >&2
+      return 1
+    fi
+    NEEDS_RELOCK=1
+  fi
+
+  if ! cp -p -- "$BACKUP_PATH" "$restore_tmp" || ! mv -f -- "$restore_tmp" "$CONFIG_PATH"; then
+    printf '错误：无法恢复原配置；原配置备份：%s\n' "$BACKUP_PATH" >&2
+    return 1
+  fi
+
+  if [[ "$CONFIG_PATH" == /etc/* ]] && command -v chattr >/dev/null 2>&1; then
+    if chattr +i "$CONFIG_PATH"; then
+      NEEDS_RELOCK=0
+    else
+      printf '警告：原配置已恢复，但未能重新锁定：%s\n' "$CONFIG_PATH" >&2
+    fi
+  fi
+
+  printf '已回滚到重启前配置：%s\n' "$CONFIG_PATH" >&2
+}
+
 if ((DO_RESTART)); then
   if command -v systemctl >/dev/null 2>&1; then
     if systemctl restart smartdns; then
       printf 'SmartDNS 已重启。\n'
     else
-      printf '警告：配置已写入，但 smartdns.service 重启失败；请检查服务状态。备份：%s\n' "$BACKUP_PATH" >&2
+      printf '错误：smartdns.service 重启失败，正在输出服务日志并恢复重启前配置。\n' >&2
+      show_restart_failure_details smartdns.service
+      if systemctl stop smartdns.service; then
+        printf '已停止失败服务，取消 systemd 自动重试。\n' >&2
+      fi
+      if rollback_config_after_restart_failure; then
+        if systemctl restart smartdns; then
+          printf '已用原配置重新启动 SmartDNS。\n' >&2
+        else
+          printf '错误：原配置已恢复，但 SmartDNS 仍无法启动；请检查上方状态和日志。\n' >&2
+          show_restart_failure_details smartdns.service
+          systemctl stop smartdns.service || true
+        fi
+      fi
       exit 1
     fi
   elif command -v service >/dev/null 2>&1; then
     if service smartdns restart; then
       printf 'SmartDNS 已重启。\n'
     else
-      printf '警告：配置已写入，但 SmartDNS 重启失败；请检查服务状态。备份：%s\n' "$BACKUP_PATH" >&2
+      printf '错误：SmartDNS 重启失败，正在恢复重启前配置。\n' >&2
+      rollback_config_after_restart_failure || true
       exit 1
     fi
   else
